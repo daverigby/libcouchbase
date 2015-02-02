@@ -406,6 +406,12 @@ class ThreadContext
 {
 public:
     ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle) {
+        dur_options.version = 0;
+        dur_options.v.v0.timeout = 0; //0 defaults to LCB_CNTL_DURABILITY_TIMEOUT
+        dur_options.v.v0.check_delete = 0; // If 1 check for the non-presence of an item
+        dur_options.v.v0.cap_max = 0; // If 1 set persist_to and replicate_to to max
+        dur_options.v.v0.persist_to = 1;
+        dur_options.v.v0.replicate_to = 0;
 
     }
 
@@ -423,6 +429,13 @@ public:
                 LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
                 error = lcb_store3(instance, this, &scmd);
 
+                // DH
+                lcb_durability_cmd_t durability_cmd;
+                durability_cmd.version = 0;
+                durability_cmd.v.v0.key = opinfo.key.c_str();
+                durability_cmd.v.v0.nkey = opinfo.key.size();
+                dcmdlist[0] = &durability_cmd;
+                lcb_durability_poll(instance, NULL, &dur_options, 1, dcmdlist);
             } else {
                 lcb_CMDGET gcmd = { 0 };
                 LCB_CMD_SET_KEY(&gcmd, opinfo.key.c_str(), opinfo.key.size());
@@ -479,7 +492,14 @@ private:
     size_t niter;
     lcb_error_t error;
     lcb_t instance;
-};
+
+    // DH
+    lcb_store_cmd_t cmds[10000];
+    const lcb_store_cmd_t *cmdlist[10000];
+    lcb_durability_opts_t dur_options = { 0 };
+    lcb_durability_cmd_t endure[10000];
+    const lcb_durability_cmd_t *dcmdlist[10000];
+}; //ThreadContext
 
 static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 {
@@ -503,6 +523,18 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
         }
     }
 #endif
+}
+
+//DH
+static void durability_callback(lcb_t instance, const void *cookie,
+                                lcb_error_t error,const lcb_durability_resp_t *resp)
+{
+    fprintf(stderr,"durabilty callback \n");
+    if (resp->v.v0.err == LCB_SUCCESS) {
+        fprintf(stderr,"Key was endured!\n");
+    } else {
+        fprintf(stderr,"Key did not endure in time: %d\n",resp->v.v0.err);
+        }
 }
 
 
@@ -615,6 +647,9 @@ int main(int argc, char **argv)
         }
         lcb_install_callback3(instance, LCB_CALLBACK_STORE, operationCallback);
         lcb_install_callback3(instance, LCB_CALLBACK_GET, operationCallback);
+        // DH
+        lcb_set_durability_callback(instance, durability_callback);
+
         cp.doCtls(instance);
 
         new InstanceCookie(instance);
