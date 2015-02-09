@@ -407,22 +407,24 @@ class ThreadContext
 public:
     ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle) {
         dur_options.version = 0;
-        dur_options.v.v0.timeout = 0; //0 defaults to LCB_CNTL_DURABILITY_TIMEOUT
-        dur_options.v.v0.check_delete = 0; // If 1 check for the non-presence of an item
-        dur_options.v.v0.cap_max = 0; // If 1 set persist_to and replicate_to to max
-        dur_options.v.v0.persist_to = 1;
-        dur_options.v.v0.replicate_to = 0;
-
     }
 
-    void singleLoop() {
+    void singleLoop()
+    {
         bool hasItems = false;
         lcb_sched_enter(instance);
         NextOp opinfo;
+        dur_options.version = 0;
+        dur_options.v.v0.persist_to = 0;
+        dur_options.v.v0.replicate_to = 1;
+        dur_options.v.v0.timeout = 1000 * 1000 * 5;
+        dur_options.v.v0.interval = 1000 * 100;//0 * 1;
+
 
         for (size_t ii = 0; ii < config.opsPerCycle; ++ii) {
             kgen.setNextOp(opinfo);
-            if (opinfo.isStore) {
+            if (opinfo.isStore)
+            {
                 lcb_CMDSTORE scmd = { 0 };
                 scmd.operation = LCB_SET;
                 LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
@@ -430,13 +432,15 @@ public:
                 error = lcb_store3(instance, this, &scmd);
 
                 // DH
-                lcb_durability_cmd_t durability_cmd;
-                durability_cmd.version = 0;
-                durability_cmd.v.v0.key = opinfo.key.c_str();
-                durability_cmd.v.v0.nkey = opinfo.key.size();
-                dcmdlist[0] = &durability_cmd;
-                lcb_durability_poll(instance, NULL, &dur_options, 1, dcmdlist);
-            } else {
+                durability_commands[ii].version = 0;
+                strcpy(keys[ii], opinfo.key.c_str());
+                durability_commands[ii].v.v0.key = keys[ii];
+                durability_commands[ii].v.v0.cas = 0;
+                durability_commands[ii].v.v0.nkey =strlen(keys[ii]);
+                durability_list[ii] = &durability_commands[ii];
+            }
+            else
+            {
                 lcb_CMDGET gcmd = { 0 };
                 LCB_CMD_SET_KEY(&gcmd, opinfo.key.c_str(), opinfo.key.size());
                 error = lcb_get3(instance, this, &gcmd);
@@ -448,12 +452,30 @@ public:
                 hasItems = true;
             }
         }
-        if (hasItems) {
+        if (hasItems)
+        {
             lcb_sched_leave(instance);
             lcb_wait(instance);
-            if (error != LCB_SUCCESS) {
+            if (error != LCB_SUCCESS)
+            {
                 log("Operation(s) failed: [0x%x] %s", error, lcb_strerror(instance, error));
             }
+
+            //fprintf( stderr, "Poll\n");
+            lcb_error_t ret = lcb_durability_poll(instance, NULL, &dur_options,config.opsPerCycle , durability_list);
+
+                if (ret != LCB_SUCCESS){
+                    for (int i = 0; i < config.opsPerCycle; i++) fprintf(stderr,"%s\n", durability_commands[i].v.v0.key);
+                    fprintf( stderr, "Poll Failed: %s", lcb_strerror(NULL, ret));
+                    exit(1);
+
+                }
+                lcb_wait(instance);
+            //    fprintf( stderr, "Poll done\n");
+
+
+
+
         } else {
             lcb_sched_fail(instance);
         }
@@ -494,26 +516,29 @@ private:
     lcb_t instance;
 
     // DH
-    lcb_store_cmd_t cmds[10000];
-    const lcb_store_cmd_t *cmdlist[10000];
     lcb_durability_opts_t dur_options = { 0 };
-    lcb_durability_cmd_t endure[10000];
-    const lcb_durability_cmd_t *dcmdlist[10000];
+    lcb_durability_cmd_t durability_commands[10000];
+    const lcb_durability_cmd_t *durability_list[10000];
+    char keys[10000][128];
+    unsigned long operation_counter = 0;
 }; //ThreadContext
 
 static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 {
     ThreadContext *tc;
-
     tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
     tc->setError(resp->rc);
 
+//    lcb_durability_poll(tc->instance, NULL, &opts, 1, cmds);
+    // error checking omitted --
+
 #ifndef WIN32
-    static volatile unsigned long nops = 1;
+
     static time_t start_time = time(NULL);
     static int is_tty = isatty(STDOUT_FILENO);
     if (is_tty) {
-        if (++nops % 1000 == 0) {
+        static volatile unsigned long nops = 0;
+        if (++nops % 10000 == 0) {
             time_t now = time(NULL);
             time_t nsecs = now - start_time;
             if (!nsecs) { nsecs = 1; }
@@ -529,14 +554,27 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 static void durability_callback(lcb_t instance, const void *cookie,
                                 lcb_error_t error,const lcb_durability_resp_t *resp)
 {
-    fprintf(stderr,"durabilty callback \n");
-    if (resp->v.v0.err == LCB_SUCCESS) {
-        fprintf(stderr,"Key was endured!\n");
-    } else {
-        fprintf(stderr,"Key did not endure in time: %d\n",resp->v.v0.err);
-        }
+    if (resp->v.v0.nresponses != 2)
+    {
+    fprintf(stderr,"resp: %d\n", resp->v.v0.nresponses);
 }
 
+    if (resp->v.v0.err == LCB_SUCCESS) {
+//        fprintf(stderr,"Key %s was endured!\n", resp->v.v0.key);
+    }
+    else
+    {
+        switch (resp->v.v0.err )
+        {
+            case LCB_KEY_ENOENT:
+                fprintf(stderr,"Key %s not found on server?: %s\n",resp->v.v0.key, lcb_strerror(NULL, resp->v.v0.err));
+                break;
+            default:
+                fprintf(stderr,"Key %s did not endure: %s\n",resp->v.v0.key,lcb_strerror(NULL, resp->v.v0.err));
+                break;
+        }
+    }
+}
 
 std::list<ThreadContext *> contexts;
 
@@ -654,8 +692,10 @@ int main(int argc, char **argv)
 
         new InstanceCookie(instance);
 
+
         lcb_connect(instance);
         lcb_wait(instance);
+
         error = lcb_get_bootstrap_status(instance);
 
         if (error != LCB_SUCCESS) {
