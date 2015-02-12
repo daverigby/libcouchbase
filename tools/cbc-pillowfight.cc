@@ -460,7 +460,10 @@ public:
         if (hasItems)
         {
             lcb_sched_leave(instance);
+            lcb_U64 store_dispatch_time = lcb_nstime();
             lcb_wait(instance);
+            lcb_U64 store_complete_time = lcb_nstime();
+
             if (error != LCB_SUCCESS)
             {
                 log("Operation(s) failed: [0x%x] %s", error, lcb_strerror(instance, error));
@@ -475,7 +478,13 @@ public:
                     exit(1);
 
                 }
-                lcb_wait(instance);
+            lcb_wait(instance);
+            lcb_U64 replication_complete_time = lcb_nstime();
+
+            fprintf(stderr, "Store took %0.3fms; Replication took additional %0.3f ms (batch size %d).\n",
+                    double(store_complete_time - store_dispatch_time) / 1e6,
+                    double(replication_complete_time - store_complete_time) / 1e6,
+                    config.opsPerCycle);
             //    fprintf( stderr, "Poll done\n");
 
 
