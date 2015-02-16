@@ -22,6 +22,7 @@
 #include <map>
 #include <sstream>
 #include <queue>
+#include <set>
 #include <list>
 #include <cstring>
 #include <cassert>
@@ -250,6 +251,9 @@ void log(const char *format, ...)
 
 extern "C" {
 static void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+static void storeCallback(lcb_t, int, const lcb_RESPBASE*);
+static void durability_callback(lcb_t instance, const void *cookie,
+                                lcb_error_t error,const lcb_durability_resp_t *resp);
 }
 
 class InstanceCookie {
@@ -425,6 +429,7 @@ public:
         dur_options.v.v0.timeout = 1000 * 1000 * 5;
         dur_options.v.v0.interval = 1000 * 100;//0 * 1;
 
+        replication_times.clear();
 
         for (size_t ii = 0; ii < config.opsPerCycle; ++ii) {
             kgen.setNextOp(opinfo);
@@ -435,14 +440,6 @@ public:
                 LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
                 LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
                 error = lcb_store3(instance, this, &scmd);
-
-                // DH
-                durability_commands[ii].version = 0;
-                strcpy(keys[ii], opinfo.key.c_str());
-                durability_commands[ii].v.v0.key = keys[ii];
-                durability_commands[ii].v.v0.cas = 0;
-                durability_commands[ii].v.v0.nkey =strlen(keys[ii]);
-                durability_list[ii] = &durability_commands[ii];
             }
             else
             {
@@ -462,34 +459,25 @@ public:
             lcb_sched_leave(instance);
             lcb_U64 store_dispatch_time = lcb_nstime();
             lcb_wait(instance);
-            lcb_U64 store_complete_time = lcb_nstime();
 
             if (error != LCB_SUCCESS)
             {
                 log("Operation(s) failed: [0x%x] %s", error, lcb_strerror(instance, error));
             }
 
-            //fprintf( stderr, "Poll\n");
-            lcb_error_t ret = lcb_durability_poll(instance, NULL, &dur_options,config.opsPerCycle , durability_list);
+            std::vector<double> replication_histo;
+            for (auto& key : replication_times) {
+                // calculate delta since dispatch; convert ns to ms.
+                replication_histo.push_back(double(key.second - store_dispatch_time) / 1e6);
+            }
+            std::sort(replication_histo.begin(), replication_histo.end());
 
-                if (ret != LCB_SUCCESS){
-                    for (int i = 0; i < config.opsPerCycle; i++) fprintf(stderr,"%s\n", durability_commands[i].v.v0.key);
-                    fprintf( stderr, "Poll Failed: %s", lcb_strerror(NULL, ret));
-                    exit(1);
+            double median = replication_histo[replication_histo.size() / 2];
+            double percentile_95 = replication_histo[(95 * replication_histo.size()) / 100];
+            double percentile_99 = replication_histo[(99 * replication_histo.size()) / 100];
 
-                }
-            lcb_wait(instance);
-            lcb_U64 replication_complete_time = lcb_nstime();
-
-            fprintf(stderr, "Store took %0.3fms; Replication took additional %0.3f ms (batch size %d).\n",
-                    double(store_complete_time - store_dispatch_time) / 1e6,
-                    double(replication_complete_time - store_complete_time) / 1e6,
-                    config.opsPerCycle);
-            //    fprintf( stderr, "Poll done\n");
-
-
-
-
+            fprintf(stderr, "Store+replicate - Median: %0.2f ms, 95%%: %0.2f ms, 99%%: %0.2f ms\n",
+                    median, percentile_95, percentile_99);
         } else {
             lcb_sched_fail(instance);
         }
@@ -538,9 +526,16 @@ public:
 protected:
     // the callback methods needs to be able to set the error handler..
     friend void operationCallback(lcb_t, int, const lcb_RESPBASE*);
+    friend void storeCallback(lcb_t, int, const lcb_RESPBASE*);
+    friend void durability_callback(lcb_t, const void *, lcb_error_t, const lcb_durability_resp_t *);
+
     Histogram histogram;
 
     void setError(lcb_error_t e) { error = e; }
+
+    void setKeyReplicated(const char* key) {
+        replication_times[key] = lcb_nstime();
+    }
 
 private:
     KeyGenerator kgen;
@@ -550,21 +545,12 @@ private:
 
     // DH
     lcb_durability_opts_t dur_options = { 0 };
-    lcb_durability_cmd_t durability_commands[10000];
-    const lcb_durability_cmd_t *durability_list[10000];
-    char keys[10000][128];
-    unsigned long operation_counter = 0;
+    std::map<std::string, lcb_U64> replication_times;
 }; //ThreadContext
 
-static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
+
+static void updateOpsPerSecDisplay()
 {
-    ThreadContext *tc;
-    tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
-    tc->setError(resp->rc);
-
-//    lcb_durability_poll(tc->instance, NULL, &opts, 1, cmds);
-    // error checking omitted --
-
 #ifndef WIN32
 
     static time_t start_time = time(NULL);
@@ -583,14 +569,53 @@ static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
 #endif
 }
 
+static void operationCallback(lcb_t, int, const lcb_RESPBASE *resp)
+{
+    ThreadContext *tc;
+    tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
+    tc->setError(resp->rc);
+
+    updateOpsPerSecDisplay();
+}
+
+static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
+{
+    ThreadContext *tc;
+    tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
+    tc->setError(resp->rc);
+
+    // Schedule a durability callback for the store.
+    lcb_durability_cmd_t endure = { 0 };
+    endure.v.v0.key = resp->key;
+    endure.v.v0.nkey = resp->nkey;
+    endure.v.v0.cas = resp->cas;
+    const lcb_durability_cmd_t *cmdlist = &endure;
+    lcb_error_t ret = lcb_durability_poll(tc->instance, tc, &(tc->dur_options),
+                                          1, &cmdlist);
+    if (ret != LCB_SUCCESS) {
+        fprintf( stderr, "Poll Failed: %s\n", lcb_strerror(NULL, ret));
+        exit(1);
+    }
+
+    updateOpsPerSecDisplay();
+}
+
 //DH
 static void durability_callback(lcb_t instance, const void *cookie,
                                 lcb_error_t error,const lcb_durability_resp_t *resp)
 {
-    if (resp->v.v0.nresponses != 2)
+    (void)instance;
+    (void)error;
+
+    // Expect to replicate to one other node.
+    if (resp->v.v0.nreplicated != 1)
     {
-    fprintf(stderr,"resp: %d\n", resp->v.v0.nresponses);
-}
+        fprintf(stderr,"nreplicated: expected 1, got %d\n", resp->v.v0.nreplicated);
+    }
+
+    ThreadContext *tc;
+    tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(cookie));
+    tc->setKeyReplicated((const char*)resp->v.v0.key);
 
     if (resp->v.v0.err == LCB_SUCCESS) {
 //        fprintf(stderr,"Key %s was endured!\n", resp->v.v0.key);
@@ -716,7 +741,7 @@ int main(int argc, char **argv)
             log("Failed to create instance: %s", lcb_strerror(NULL, error));
             exit(EXIT_FAILURE);
         }
-        lcb_install_callback3(instance, LCB_CALLBACK_STORE, operationCallback);
+        lcb_install_callback3(instance, LCB_CALLBACK_STORE, storeCallback);
         lcb_install_callback3(instance, LCB_CALLBACK_GET, operationCallback);
         // DH
         lcb_set_durability_callback(instance, durability_callback);
