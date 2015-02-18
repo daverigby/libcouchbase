@@ -37,6 +37,7 @@
 #include <cstdarg>
 #include "common/options.h"
 #include "common/histogram.h"
+#include <algorithm>
 
 using namespace std;
 using namespace cbc;
@@ -77,6 +78,7 @@ public:
         o_minSize("min-size"),
         o_maxSize("max-size"),
         o_noPopulate("no-population"),
+        o_durability("durability"),
         o_pauseAtEnd("pause-at-end"),
         o_numCycles("num-cycles"),
         o_sequential("sequential"),
@@ -92,6 +94,7 @@ public:
         o_minSize.setDefault(50).abbrev('m').description("Set minimum payload size");
         o_maxSize.setDefault(5120).abbrev('M').description("Set maximum payload size");
         o_noPopulate.setDefault(false).abbrev('n').description("Skip population");
+        o_durability.setDefault(false).abbrev('d').description("Perform durability checks");
         o_pauseAtEnd.setDefault(false).abbrev('E').description("Pause at end of run (holding connections open) until user input");
         o_numCycles.setDefault(-1).abbrev('c').description("Number of cycles to be run until exiting. Set to -1 to loop infinitely");
         o_sequential.setDefault(false).description("Use sequential access (instead of random)");
@@ -104,6 +107,7 @@ public:
         prefix = o_keyPrefix.result();
         setprc = o_setPercent.result();
         shouldPopulate = !o_noPopulate.result();
+        durability = o_durability.result();
         setPayloadSizes(o_minSize.result(), o_maxSize.result());
 
         if (depr.loop.passed()) {
@@ -127,6 +131,7 @@ public:
         parser.addOption(o_randSeed);
         parser.addOption(o_setPercent);
         parser.addOption(o_noPopulate);
+        parser.addOption(o_durability);
         parser.addOption(o_minSize);
         parser.addOption(o_maxSize);
         parser.addOption(o_pauseAtEnd);
@@ -211,6 +216,7 @@ public:
     volatile int maxCycles;
     bool dgm;
     bool shouldPopulate;
+    bool durability;
     uint32_t waitTime;
     ConnParams params;
 
@@ -224,6 +230,7 @@ private:
     UIntOption o_minSize;
     UIntOption o_maxSize;
     BoolOption o_noPopulate;
+    BoolOption o_durability;
     BoolOption o_pauseAtEnd; // Should pillowfight pause execution (with
                              // connections open) before exiting?
     IntOption o_numCycles;
@@ -465,19 +472,26 @@ public:
                 log("Operation(s) failed: [0x%x] %s", error, lcb_strerror(instance, error));
             }
 
-            std::vector<double> replication_histo;
-            for (auto& key : replication_times) {
-                // calculate delta since dispatch; convert ns to ms.
-                replication_histo.push_back(double(key.second - store_dispatch_time) / 1e6);
+            // display durability metrics once per batch size.
+            if (config.durability ){
+                // Form an ordered histogram of batch timings.
+                std::vector<double> replication_histo;
+                for (std::map<std::string, lcb_U64>::const_iterator it = replication_times.begin();
+                     it != replication_times.end();
+                     it++) {
+                    // calculate delta since dispatch; convert ns to ms.
+                    replication_histo.push_back(
+                            double(it->second - store_dispatch_time) / 1e6);
+                }
+                std::sort(replication_histo.begin(), replication_histo.end());
+
+                double median = replication_histo[replication_histo.size() / 2];
+                double percentile_95 = replication_histo[(95 * replication_histo.size()) / 100];
+                double percentile_99 = replication_histo[(99 * replication_histo.size()) / 100];
+
+                printf("%f Store+replicate - Median: %0.2f ms, 95%%: %0.2f ms, 99%%: %0.2f ms\n",
+                (double)store_dispatch_time, median, percentile_95, percentile_99);
             }
-            std::sort(replication_histo.begin(), replication_histo.end());
-
-            double median = replication_histo[replication_histo.size() / 2];
-            double percentile_95 = replication_histo[(95 * replication_histo.size()) / 100];
-            double percentile_99 = replication_histo[(99 * replication_histo.size()) / 100];
-
-            fprintf(stderr, "Store+replicate - Median: %0.2f ms, 95%%: %0.2f ms, 99%%: %0.2f ms\n",
-                    median, percentile_95, percentile_99);
         } else {
             lcb_sched_fail(instance);
         }
@@ -584,19 +598,22 @@ static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
     tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
     tc->setError(resp->rc);
 
-    // Schedule a durability callback for the store.
-    lcb_durability_cmd_t endure = { 0 };
-    endure.v.v0.key = resp->key;
-    endure.v.v0.nkey = resp->nkey;
-    endure.v.v0.cas = resp->cas;
-    const lcb_durability_cmd_t *cmdlist = &endure;
-    lcb_error_t ret = lcb_durability_poll(tc->instance, tc, &(tc->dur_options),
-                                          1, &cmdlist);
-    if (ret != LCB_SUCCESS) {
-        fprintf( stderr, "Poll Failed: %s\n", lcb_strerror(NULL, ret));
-        exit(1);
-    }
+    if (config.durability){
+        // Schedule a durability callback for the store.
+        lcb_durability_cmd_t endure = { 0 };
+        endure.v.v0.key = resp->key;
+        endure.v.v0.nkey = resp->nkey;
+        endure.v.v0.cas = resp->cas;
+        //fprintf(stderr,"Key %-22.22s has CAS: %p\n",resp->key, resp->cas );
 
+        const lcb_durability_cmd_t *cmdlist = &endure;
+        lcb_error_t ret = lcb_durability_poll(tc->instance, tc, &(tc->dur_options),
+                                              1, &cmdlist);
+        if (ret != LCB_SUCCESS) {
+            fprintf( stderr, "Poll Failed: %s\n", lcb_strerror(NULL, ret));
+            exit(1);
+        }
+    }
     updateOpsPerSecDisplay();
 }
 
@@ -618,7 +635,7 @@ static void durability_callback(lcb_t instance, const void *cookie,
     tc->setKeyReplicated((const char*)resp->v.v0.key);
 
     if (resp->v.v0.err == LCB_SUCCESS) {
-//        fprintf(stderr,"Key %s was endured!\n", resp->v.v0.key);
+//        fprintf(stderr,"Key %s was endured with CAS %p after %d tries!\n", resp->v.v0.key, resp->v.v0.cas, resp->v.v0.nresponses );
     }
     else
     {
