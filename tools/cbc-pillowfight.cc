@@ -509,10 +509,7 @@ public:
         }
     }
 
-    void runAsync() {
-        tokens = config.getTokens();
-
-        // Spool up as many ops as we have tokens
+    void spoolOperations() {
         lcb_sched_enter(instance);
         while (tokens > 0) {
             if (scheduleNextOperation()) {
@@ -520,6 +517,13 @@ public:
             }
         }
         lcb_sched_leave(instance);
+    }
+
+    void runAsync() {
+        tokens = config.getTokens();
+
+        // Spool up as many ops as we have tokens
+        spoolOperations();
 
         // Wait until requested operations are complete.
         do {
@@ -584,6 +588,7 @@ protected:
         in_flight_timings.erase(it);
 
         completed_timings.push_back(duration);
+        tokens++;
     }
 
 private:
@@ -658,14 +663,14 @@ static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
             exit(1);
         }
     } else {
-        if (!config.isLoopDone(++tc->niter)) {
-            // Schedule next op now.
-            lcb_sched_enter(tc->instance);
-            tc->scheduleNextOperation();
-            lcb_sched_leave(tc->instance);
-        } else {
+        if (config.isLoopDone(++tc->niter)) {
             // Done
             lcb_breakout(tc->instance);
+        } else {
+            // Schedule more operations (if we have enough tokens)
+            if (tc->tokens >= config.opsPerCycle) {
+                tc->spoolOperations();
+            }
         }
     }
     updateOpsPerSecDisplay();
@@ -704,14 +709,14 @@ static void durability_callback(lcb_t instance, const void *cookie,
         }
     }
 
-    if (!config.isLoopDone(++tc->niter)) {
-        // Schedule next op now.
-        lcb_sched_enter(tc->instance);
-        tc->scheduleNextOperation();
-        lcb_sched_leave(tc->instance);
-    } else {
+    if (config.isLoopDone(++tc->niter)) {
         // Done
         lcb_breakout(tc->instance);
+    } else {
+        // Schedule more operations (if we have enough tokens)
+        if (tc->tokens >= config.opsPerCycle) {
+            tc->spoolOperations();
+        }
     }
 
     if (tc->niter % config.opsPerCycle == 0) {
