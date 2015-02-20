@@ -83,7 +83,8 @@ public:
         o_numCycles("num-cycles"),
         o_sequential("sequential"),
         o_startAt("start-at"),
-        o_rateLimit("rate-limit")
+        o_rateLimit("rate-limit"),
+        o_tokens("tokens")
     {
         o_multiSize.setDefault(100).abbrev('B').description("Number of operations to batch");
         o_numItems.setDefault(1000).abbrev('I').description("Number of items to operate on");
@@ -100,6 +101,7 @@ public:
         o_sequential.setDefault(false).description("Use sequential access (instead of random)");
         o_startAt.setDefault(0).description("For sequential access, set the first item");
         o_rateLimit.setDefault(0).abbrev('l').description("Set operations per second limit (per thread)");
+        o_tokens.setDefault(0).description("Maximum number of operations in-flight (per thread)");
     }
 
     void processOptions() {
@@ -139,6 +141,7 @@ public:
         parser.addOption(o_sequential);
         parser.addOption(o_startAt);
         parser.addOption(o_rateLimit);
+        parser.addOption(o_tokens);
         params.addToParser(parser);
         depr.addOptions(parser);
     }
@@ -205,6 +208,7 @@ public:
     unsigned firstKeyOffset() { return o_startAt; }
     uint32_t getNumItems() { return o_numItems; }
     uint32_t getRateLimit() { return o_rateLimit; }
+    uint32_t getTokens() { return o_tokens; }
 
     void *data;
 
@@ -237,6 +241,7 @@ private:
     BoolOption o_sequential;
     UIntOption o_startAt;
     UIntOption o_rateLimit;
+    UIntOption o_tokens;
     DeprecatedOptions depr;
 } config;
 
@@ -423,6 +428,10 @@ class ThreadContext
 public:
     ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle) {
         dur_options.version = 0;
+        dur_options.v.v0.persist_to = 0;
+        dur_options.v.v0.replicate_to = 1;
+        dur_options.v.v0.timeout = 1000 * 1000 * 5;
+        dur_options.v.v0.interval = 1000 * 100;//0 * 1;
     }
 
     void singleLoop()
@@ -436,30 +445,8 @@ public:
         dur_options.v.v0.timeout = 1000 * 1000 * 5;
         dur_options.v.v0.interval = 1000 * 100;//0 * 1;
 
-        replication_times.clear();
-
         for (size_t ii = 0; ii < config.opsPerCycle; ++ii) {
-            kgen.setNextOp(opinfo);
-            if (opinfo.isStore)
-            {
-                lcb_CMDSTORE scmd = { 0 };
-                scmd.operation = LCB_SET;
-                LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
-                LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
-                error = lcb_store3(instance, this, &scmd);
-            }
-            else
-            {
-                lcb_CMDGET gcmd = { 0 };
-                LCB_CMD_SET_KEY(&gcmd, opinfo.key.c_str(), opinfo.key.size());
-                error = lcb_get3(instance, this, &gcmd);
-            }
-            if (error != LCB_SUCCESS) {
-                hasItems = false;
-                log("Failed to schedule operation: [0x%x] %s", error, lcb_strerror(instance, error));
-            } else {
-                hasItems = true;
-            }
+            hasItems = scheduleNextOperation();
         }
         if (hasItems)
         {
@@ -473,28 +460,71 @@ public:
             }
 
             // display durability metrics once per batch size.
-            if (config.durability ){
-                // Form an ordered histogram of batch timings.
-                std::vector<double> replication_histo;
-                for (std::map<std::string, lcb_U64>::const_iterator it = replication_times.begin();
-                     it != replication_times.end();
-                     it++) {
-                    // calculate delta since dispatch; convert ns to ms.
-                    replication_histo.push_back(
-                            double(it->second - store_dispatch_time) / 1e6);
-                }
-                std::sort(replication_histo.begin(), replication_histo.end());
-
-                double median = replication_histo[replication_histo.size() / 2];
-                double percentile_95 = replication_histo[(95 * replication_histo.size()) / 100];
-                double percentile_99 = replication_histo[(99 * replication_histo.size()) / 100];
-
-                printf("%f Store+replicate - Median: %0.2f ms, 95%%: %0.2f ms, 99%%: %0.2f ms\n",
-                (double)store_dispatch_time, median, percentile_95, percentile_99);
+            if (config.durability) {
+                printDurabilityStatistics();
             }
         } else {
             lcb_sched_fail(instance);
         }
+    }
+
+    void printDurabilityStatistics() {
+        // Sort our complete timings, convert ns to ms, then dump them to screen.
+        std::sort(completed_timings.begin(), completed_timings.end());
+        
+        double median = completed_timings[completed_timings.size() / 2] / 1e6;
+        double percentile_95 = completed_timings[(95 * completed_timings.size()) / 100] / 1e6;
+        double percentile_99 = completed_timings[(99 * completed_timings.size()) / 100] / 1e6;
+        
+        printf("%lld Store+replicate - Median: %0.2f ms, 95%%: %0.2f ms, 99%%: %0.2f ms\n",
+               lcb_nstime(), median, percentile_95, percentile_99);
+
+        completed_timings.clear();
+    }
+
+    bool scheduleNextOperation() {
+        NextOp opinfo;
+
+        kgen.setNextOp(opinfo);
+        if (opinfo.isStore)
+        {
+            lcb_CMDSTORE scmd = { 0 };
+            scmd.operation = LCB_SET;
+            LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
+            LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
+            error = lcb_store3(instance, this, &scmd);
+            in_flight_timings.insert(std::make_pair(opinfo.key, lcb_nstime()));
+        }
+        else
+        {
+            lcb_CMDGET gcmd = { 0 };
+            LCB_CMD_SET_KEY(&gcmd, opinfo.key.c_str(), opinfo.key.size());
+            error = lcb_get3(instance, this, &gcmd);
+        }
+        if (error != LCB_SUCCESS) {
+            log("Failed to schedule operation: [0x%x] %s", error, lcb_strerror(instance, error));
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    void runAsync() {
+        tokens = config.getTokens();
+
+        // Spool up as many ops as we have tokens
+        lcb_sched_enter(instance);
+        while (tokens > 0) {
+            if (scheduleNextOperation()) {
+                tokens--;
+            }
+        }
+        lcb_sched_leave(instance);
+
+        // Wait until requested operations are complete.
+        do {
+            lcb_wait(instance);
+        } while (!config.isLoopDone(niter));
     }
 
     bool run() {
@@ -548,7 +578,12 @@ protected:
     void setError(lcb_error_t e) { error = e; }
 
     void setKeyReplicated(const char* key) {
-        replication_times[key] = lcb_nstime();
+        std::map<std::string, lcb_U64>::iterator it = in_flight_timings.find(key);
+        assert(it != in_flight_timings.end());
+        lcb_U64 duration = lcb_nstime() - it->second;
+        in_flight_timings.erase(it);
+
+        completed_timings.push_back(duration);
     }
 
 private:
@@ -556,10 +591,15 @@ private:
     size_t niter;
     lcb_error_t error;
     lcb_t instance;
+    int tokens;
 
     // DH
     lcb_durability_opts_t dur_options = { 0 };
-    std::map<std::string, lcb_U64> replication_times;
+    // Map of key -> store start time.
+    std::map<std::string, lcb_U64> in_flight_timings;
+
+    // (unordered) vector of store+replicate timings for completed ops.
+    std::vector<lcb_U64> completed_timings;
 }; //ThreadContext
 
 
@@ -598,7 +638,11 @@ static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
     tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(resp->cookie));
     tc->setError(resp->rc);
 
-    if (config.durability){
+    if (resp->rc != LCB_SUCCESS) {
+         fprintf( stderr, "Store Failed: %s\n", lcb_strerror(NULL, resp->rc));
+    }
+
+    if (config.durability) {
         // Schedule a durability callback for the store.
         lcb_durability_cmd_t endure = { 0 };
         endure.v.v0.key = resp->key;
@@ -612,6 +656,16 @@ static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
         if (ret != LCB_SUCCESS) {
             fprintf( stderr, "Poll Failed: %s\n", lcb_strerror(NULL, ret));
             exit(1);
+        }
+    } else {
+        if (!config.isLoopDone(++tc->niter)) {
+            // Schedule next op now.
+            lcb_sched_enter(tc->instance);
+            tc->scheduleNextOperation();
+            lcb_sched_leave(tc->instance);
+        } else {
+            // Done
+            lcb_breakout(tc->instance);
         }
     }
     updateOpsPerSecDisplay();
@@ -648,6 +702,20 @@ static void durability_callback(lcb_t instance, const void *cookie,
                 fprintf(stderr,"Key %s did not endure: %s\n",resp->v.v0.key,lcb_strerror(NULL, resp->v.v0.err));
                 break;
         }
+    }
+
+    if (!config.isLoopDone(++tc->niter)) {
+        // Schedule next op now.
+        lcb_sched_enter(tc->instance);
+        tc->scheduleNextOperation();
+        lcb_sched_leave(tc->instance);
+    } else {
+        // Done
+        lcb_breakout(tc->instance);
+    }
+
+    if (tc->niter % config.opsPerCycle == 0) {
+        tc->printDurabilityStatistics();
     }
 }
 
@@ -722,7 +790,11 @@ extern "C" {
 static void *thread_worker(void *arg)
 {
     ThreadContext *ctx = static_cast<ThreadContext *>(arg);
-    ctx->run();
+    if (config.getTokens() > 0) {
+        ctx->runAsync();
+    } else {
+        ctx->run();
+    }
     return NULL;
 }
 }
