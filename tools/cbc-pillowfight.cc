@@ -719,7 +719,8 @@ static void durability_callback(lcb_t instance, const void *cookie,
         }
     }
 
-    if (tc->niter % config.opsPerCycle == 0) {
+    // TODO: make configurable.
+    if (tc->niter % 10000 == 0) {
         tc->printDurabilityStatistics();
     }
 }
