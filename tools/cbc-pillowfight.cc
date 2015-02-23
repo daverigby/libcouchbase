@@ -493,7 +493,9 @@ public:
             LCB_CMD_SET_KEY(&scmd, opinfo.key.c_str(), opinfo.key.size());
             LCB_CMD_SET_VALUE(&scmd, config.data, opinfo.valsize);
             error = lcb_store3(instance, this, &scmd);
-            in_flight_timings.insert(std::make_pair(opinfo.key, lcb_nstime()));
+            if (config.durability) {
+                in_flight_timings.insert(std::make_pair(opinfo.key, lcb_nstime()));
+            }
         }
         else
         {
