@@ -590,7 +590,6 @@ protected:
         in_flight_timings.erase(it);
 
         completed_timings.push_back(duration);
-        tokens++;
     }
 
 private:
@@ -665,6 +664,8 @@ static void storeCallback(lcb_t, int, const lcb_RESPBASE *resp)
             exit(1);
         }
     } else {
+        tc->tokens++;
+
         if (config.isLoopDone(++tc->niter)) {
             // Done
             lcb_breakout(tc->instance);
@@ -694,6 +695,7 @@ static void durability_callback(lcb_t instance, const void *cookie,
     ThreadContext *tc;
     tc = const_cast<ThreadContext *>(reinterpret_cast<const ThreadContext *>(cookie));
     tc->setKeyReplicated((const char*)resp->v.v0.key);
+    tc->tokens++;
 
     if (resp->v.v0.err == LCB_SUCCESS) {
 //        fprintf(stderr,"Key %s was endured with CAS %p after %d tries!\n", resp->v.v0.key, resp->v.v0.cas, resp->v.v0.nresponses );
