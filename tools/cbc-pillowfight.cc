@@ -426,7 +426,7 @@ private:
 class ThreadContext
 {
 public:
-    ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), instance(handle) {
+    ThreadContext(lcb_t handle, int ix) : kgen(ix), niter(0), tokens(0), instance(handle) {
         dur_options.version = 0;
         dur_options.v.v0.persist_to = 0;
         dur_options.v.v0.replicate_to = 1;
