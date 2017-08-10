@@ -7,7 +7,7 @@ ADD_EXECUTABLE(cbc cbc.cc
     $<TARGET_OBJECTS:lcbtools> $<TARGET_OBJECTS:cliopts> $<TARGET_OBJECTS:lcb_jsoncpp>)
 TARGET_LINK_LIBRARIES(cbc couchbase)
 
-ADD_EXECUTABLE(cbc-pillowfight cbc-pillowfight.cc
+ADD_EXECUTABLE(cbc-pillowfight cbc-pillowfight.cc MurmurHash3.cpp
     $<TARGET_OBJECTS:lcbtools> $<TARGET_OBJECTS:cliopts> $<TARGET_OBJECTS:lcb_jsoncpp>)
 
 TARGET_LINK_LIBRARIES(cbc-pillowfight couchbase)

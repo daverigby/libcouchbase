@@ -44,6 +44,7 @@
 
 #include "docgen/seqgen.h"
 #include "docgen/docgen.h"
+#include "MurmurHash3.h"
 
 using namespace std;
 using namespace cbc;
@@ -496,9 +497,20 @@ public:
     }
 
     void generateKey(NextOp& op) {
+
         uint32_t seqno = op.m_seqno;
-        char buffer[21];
-        snprintf(buffer, sizeof(buffer), "%020d", seqno);
+        // Generate a 32 byte (256b) , deterministic hash from the seqno. This is then
+        // printed as a 64 char hex string.
+        uint64_t hash[4];
+        // Hash seqno and it's complement to generate 256 bits of hash.
+        MurmurHash3_x64_128((char*)&seqno, sizeof(seqno), 0, &hash[0]);
+        seqno = ~seqno;
+        MurmurHash3_x64_128((char*)&seqno, sizeof(seqno), 0, &hash[2]);
+
+        char buffer[64 + 1];
+        snprintf(buffer, sizeof(buffer), "%016lx%016lx%016lx%016lx",
+                 hash[0], hash[1], hash[2], hash[3]);
+
         op.m_key.assign(config.getKeyPrefix() + buffer);
     }
 
